@@ -6,110 +6,87 @@ from streamlit_js_eval import get_geolocation
 from datetime import datetime, timedelta, timezone
 
 # --- CONFIG ---
-st.set_page_config(page_title="Israel Bus Tracker 2026", layout="wide")
+st.set_page_config(page_title="Kefar Sava Bus Tracker", layout="wide")
 BASE_URL = "https://open-bus-stride-api.hasadna.org.il"
 
-st.title("🚌 Israel Live Bus Tracker")
+st.title("🚌 My Local Bus Tracker (Kefar Sava / Israel)")
 
-# 1. GPS LOCATION (With Error Handling)
+# 1. GET GPS LOCATION
 loc = get_geolocation()
 if loc and 'coords' in loc:
-    u_lat, u_lon = loc['coords']['latitude'], loc['coords']['longitude']
+    u_lat = loc['coords']['latitude']
+    u_lon = loc['coords']['longitude']
 else:
-    st.info("📍 Waiting for GPS... (Using default location: Kefar Sava)")
-    u_lat, u_lon = 32.1782, 34.9076 
+    st.warning("📍 Waiting for GPS... Using Kefar Sava coordinates as fallback.")
+    u_lat, u_lon = 32.1782, 34.9076 # Default Kefar Sava
 
 # 2. SIDEBAR
 with st.sidebar:
-    st.header("Bus Search")
-    bus_num = st.text_input("Line Number:", value="149")
-    st.caption("Try 149 (Kefar Sava) or 189 (Tel Aviv)")
-    if st.button("Refresh Map"):
+    st.header("Settings")
+    bus_num = st.text_input("Bus Number to show:", value="149")
+    distance_check = st.slider("Search Radius (km)", 1, 10, 5)
+    if st.button("Refresh Now"):
         st.rerun()
 
-# --- 3. THE ROBUST DATA ENGINE ---
-def get_bus_data(line_number):
+# --- 3. THE "BOUNDING BOX" ENGINE ---
+def get_local_buses(lat, lon, radius_km, target_line):
+    # Calculate a rough bounding box (0.01 degree is ~1.1km)
+    offset = radius_km / 111.0
+    
+    params = {
+        "lat__gte": lat - offset,
+        "lat__lte": lat + offset,
+        "lon__gte": lon - offset,
+        "lon__lte": lon + offset,
+        "recorded_at_time__gte": (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 200 # Get more buses to filter through
+    }
+    
     try:
-        # Step 1: Find Route IDs
-        r1 = requests.get(f"{BASE_URL}/gtfs_routes/list", params={"route_short_name": line_number, "limit": 10}, timeout=10)
-        route_data = r1.json()
+        # We fetch ALL buses in your 5km area
+        r = requests.get(f"{BASE_URL}/siri_vehicle_locations/list", params=params, timeout=10)
+        all_local_buses = r.json()
         
-        # Check if the response is a list (API success)
-        if not isinstance(route_data, list) or not route_data:
-            return [], "No active route records found for this line."
-        
-        gtfs_ids = [r['id'] for r in route_data]
+        if not isinstance(all_local_buses, list):
+            return [], "API error: Unexpected response format."
 
-        # Step 2: Get Recent Rides
-        # Using 2026-compliant timezone-aware datetime
-        now = datetime.now(timezone.utc)
-        start_limit = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        r2 = requests.get(
-            f"{BASE_URL}/siri_rides/list", 
-            params={
-                "siri_route__gtfs_route_id__in": ",".join(map(str, gtfs_ids)),
-                "scheduled_start_time__gte": start_limit,
-                "limit": 50
-            }, timeout=10
-        )
-        ride_data = r2.json()
-        if not isinstance(ride_data, list) or not ride_data:
-            return [], "Route found, but no buses are currently scheduled or active."
-
-        ride_ids = [r['id'] for r in ride_data]
-
-        # Step 3: Get Live GPS Positions
-        # Stride API expects ISO format or YYYY-MM-DD
-        loc_limit = (now - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        r3 = requests.get(
-            f"{BASE_URL}/siri_vehicle_locations/list",
-            params={
-                "siri_ride_id__in": ",".join(map(str, ride_ids)),
-                "recorded_at_time__gte": loc_limit,
-                "limit": 50
-            }, timeout=10
-        )
-        buses = r3.json()
-        
-        if not isinstance(buses, list):
-            return [], "API busy or returned unexpected data format."
-            
-        return buses, f"Success! Tracking {len(buses)} active buses."
+        # Now, we manually filter for YOUR line number in the data
+        # We look for the line number in the nested 'siri_ride' metadata
+        filtered_buses = []
+        for b in all_local_buses:
+            # The API returns 'route_short_name' inside the siri_ride->gtfs_ride->gtfs_route structure
+            # To be safe, we check multiple possible fields where the line number might hide
+            try:
+                # This is the most reliable path in the current Stride schema
+                line_found = b.get('siri_ride', {}).get('siri_route', {}).get('gtfs_route', {}).get('route_short_name')
+                
+                if str(line_found) == str(target_line):
+                    filtered_buses.append(b)
+            except:
+                continue
+                
+        return filtered_buses, f"Found {len(filtered_buses)} buses for line {target_line} near you."
 
     except Exception as e:
         return [], f"Connection error: {str(e)}"
 
-# --- 4. RENDER MAP ---
+# --- 4. DISPLAY ---
 if bus_num:
-    buses, message = get_bus_data(bus_num)
+    buses, message = get_local_buses(u_lat, u_lon, distance_check, bus_num)
     
-    col1, col2 = st.columns([3, 1])
+    st.success(message)
     
-    with col1:
-        st.markdown(f"**Status:** {message}")
-        m = folium.Map(location=[u_lat, u_lon], zoom_start=13)
+    m = folium.Map(location=[u_lat, u_lon], zoom_start=14)
+    
+    # Your Location (Blue)
+    folium.Marker([u_lat, u_lon], popup="You", icon=folium.Icon(color='blue', icon='user', prefix='fa')).add_to(m)
+    
+    # Bus Locations (Green)
+    for b in buses:
+        folium.Marker(
+            [b['lat'], b['lon']],
+            popup=f"Line {bus_num} | Time: {b['recorded_at_time'].split('T')[1][:5]}",
+            icon=folium.Icon(color='green', icon='bus', prefix='fa')
+        ).add_to(m)
         
-        # User
-        folium.Marker([u_lat, u_lon], popup="You", icon=folium.Icon(color='blue', icon='user', prefix='fa')).add_to(m)
-        
-        # Buses
-        for b in buses:
-            # Add small delay offset for smoother visuals
-            folium.Marker(
-                [b['lat'], b['lon']],
-                popup=f"Line {bus_num} | ID: {b['id']}",
-                icon=folium.Icon(color='green', icon='bus', prefix='fa')
-            ).add_to(m)
-            
-        st_folium(m, width=800, height=500, key="israel_map_2026")
-
-    with col2:
-        st.subheader("Details")
-        if buses:
-            st.metric("Buses Found", len(buses))
-            st.info("Green markers show reported positions from the last 20 mins.")
-        else:
-            st.write("No live vehicles detected.")
-
+    st_folium(m, width=900, height=600, key="local_bus_map")
