@@ -3,101 +3,108 @@ import requests
 import folium
 from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # --- CONFIG ---
-st.set_page_config(page_title="Israel Bus Tracker - Diagnostic", layout="wide")
+st.set_page_config(page_title="Kefar Sava Bus Tracker - UTC Fix", layout="wide")
 BASE_URL = "https://open-bus-stride-api.hasadna.org.il"
 
-st.title("🚌 Live Bus Tracker (Total Visibility)")
+st.title("🚌 Live Bus Tracker (Timezone Corrected)")
 
-# 1. GPS LOCATION
+# 1. TIME DIAGNOSTIC
+now_utc = datetime.now(timezone.utc)
+with st.sidebar:
+    st.header("Time Sync")
+    st.write(f"Local Time: `{datetime.now().strftime('%H:%M:%S')}`")
+    st.write(f"Server (UTC): `{now_utc.strftime('%H:%M:%S')}`")
+    
+    st.header("Search")
+    bus_num = st.text_input("Bus Line:", value="149")
+    radius_km = st.slider("Radius (km)", 1, 10, 5)
+    
+    if st.button("🔄 Force Refresh"):
+        st.rerun()
+
+# 2. GPS (Fallback to Kefar Sava)
 loc = get_geolocation()
 u_lat, u_lon = (loc['coords']['latitude'], loc['coords']['longitude']) if loc else (32.1782, 34.9076)
 
-# 2. SIDEBAR
-with st.sidebar:
-    st.header("Settings")
-    distance_m = st.slider("Search Radius (meters)", 500, 3000, 1200)
-    st.info("I will show ALL buses within this range of your GPS.")
-    if st.button("Refresh Map"):
-        st.rerun()
-
-# --- 3. DATA ENGINE ---
-def get_all_nearby_buses(lat, lon, dist):
+# --- 3. THE "NO-JOIN" RELIABLE ENGINE ---
+def get_buses_atomic(target_line, lat, lon, radius):
     try:
-        # Step 1: Find Local Stops
-        stop_params = {"lat": lat, "lon": lon, "distance_m": dist, "limit": 10}
-        stops_res = requests.get(f"{BASE_URL}/gtfs_stops/list", params=stop_params, timeout=10).json()
-
-        if not isinstance(stops_res, list) or not stops_res:
-            return [], "No stops found in your immediate area."
+        # We ask for the latest 200 buses in the entire country from the last 15 minutes
+        # This is the most "raw" query possible to avoid JOIN errors
+        since_utc = (now_utc - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
         
-        stop_codes = [s['code'] for s in stops_res if s.get('code')]
-
-        # Step 2: Get ALL Estimations for these stops
-        est_params = {"monitoring_ref__in": ",".join(map(str, stop_codes)), "limit": 50}
-        arrivals_data = requests.get(f"{BASE_URL}/siri_stop_estimations/list", params=est_params, timeout=10).json()
-
-        if not isinstance(arrivals_data, list):
-            return [], "API busy. Please wait a moment and refresh."
-
-        # Step 3: Get locations for these rides
-        found_buses = []
-        for arr in arrivals_data:
-            ride_id = arr.get('siri_ride_id')
-            # Attempt to find the line name from any available field
-            line_name = (
-                arr.get('siri_ride', {}).get('siri_route', {}).get('gtfs_route', {}).get('route_short_name') or 
-                arr.get('siri_ride', {}).get('siri_route', {}).get('line_ref') or 
-                "Unknown"
-            )
-
-            # Get location
-            loc_res = requests.get(f"{BASE_URL}/siri_vehicle_locations/list", 
-                                   params={"siri_ride_id": ride_id, "limit": 1}).json()
-            
-            if isinstance(loc_res, list) and loc_res:
-                bus = loc_res[0]
-                bus['line'] = line_name
-                bus['eta'] = arr.get('estimated_arrival_time', '')
-                found_buses.append(bus)
+        params = {
+            "recorded_at_time__gte": since_utc,
+            "limit": 250
+        }
         
-        return found_buses, f"Showing {len(found_buses)} buses near you."
+        # Pull the most recent 250 pulses from the whole network
+        r = requests.get(f"{BASE_URL}/siri_vehicle_locations/list", params=params, timeout=15)
+        raw_data = r.json()
+
+        if not isinstance(raw_data, list):
+            return [], f"API returned non-list data: {str(raw_data)[:50]}"
+
+        # Now, we do ALL the heavy filtering inside Python
+        # This prevents the API from ignoring our filters
+        filtered = []
+        for b in raw_data:
+            # 1. Filter by Line Number (Searching multiple meta fields)
+            try:
+                # Path 1: The standard short name
+                line = b.get('siri_ride', {}).get('siri_route', {}).get('gtfs_route', {}).get('route_short_name')
+                # Path 2: The line reference
+                line_ref = b.get('siri_ride', {}).get('siri_route', {}).get('line_ref')
+                
+                match = (str(line) == str(target_line)) or (target_line in str(line_ref))
+                
+                if not match: continue
+                
+                # 2. Filter by Distance (Simple bounding box for speed)
+                offset = radius / 111.0
+                if not (lat - offset <= b['lat'] <= lat + offset): continue
+                if not (lon - offset <= b['lon'] <= lon + offset): continue
+                
+                filtered.append(b)
+            except:
+                continue
+
+        return filtered, f"Found {len(filtered)} matches after local processing."
 
     except Exception as e:
-        return [], f"Engine Error: {str(e)}"
+        return [], f"Request Failed: {str(e)}"
 
-# --- 4. RENDER ---
-buses, log_msg = get_all_nearby_buses(u_lat, u_lon, distance_m)
+# --- 4. DISPLAY ---
+buses, status = get_buses_atomic(bus_num, u_lat, u_lon, radius_km)
 
 col1, col2 = st.columns([3, 1])
 
 with col1:
-    st.success(log_msg)
-    m = folium.Map(location=[u_lat, u_lon], zoom_start=15)
+    st.info(status)
+    m = folium.Map(location=[u_lat, u_lon], zoom_start=14)
     folium.Marker([u_lat, u_lon], popup="You", icon=folium.Icon(color='blue', icon='user', prefix='fa')).add_to(m)
 
     for b in buses:
-        label = f"Line {b['line']}"
         folium.Marker(
             [b['lat'], b['lon']],
-            popup=label,
-            tooltip=label,
+            popup=f"Line {bus_num}",
             icon=folium.Icon(color='green', icon='bus', prefix='fa')
         ).add_to(m)
-
-    st_folium(m, width=800, height=550, key="israel_map_diag")
+        
+    st_folium(m, width=800, height=550, key="israel_final_map")
 
 with col2:
-    st.subheader("Buses Found")
+    st.subheader("Results")
     if buses:
         for b in buses:
-            st.write(f"🚌 **Line {b['line']}**")
-            st.write(f"ETA: {b['eta'].split('T')[-1][:5]}")
+            st.write(f"✅ **Bus ID {b['id']}**")
+            st.write(f"Last Seen: {b['recorded_at_time'].split('T')[-1][:8]}")
             st.divider()
     else:
-        st.write("No buses are currently heading to stops near you.")
-
-with st.expander("🛠️ Debug: Raw Data From Stride"):
-    st.json(buses if buses else {"status": "Zero results from the MOT feed"})
+        st.write("No matching buses within your parameters.")
+        if st.checkbox("Show raw pool (DEBUG)"):
+            st.write("First 3 items from API (before filtering):")
+            st.json(requests.get(f"{BASE_URL}/siri_vehicle_locations/list", params={"limit": 3}).json())
