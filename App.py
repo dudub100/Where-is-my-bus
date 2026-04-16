@@ -6,105 +6,102 @@ from streamlit_js_eval import get_geolocation
 from datetime import datetime, timedelta
 
 # --- CONFIG ---
-st.set_page_config(page_title="Israel Bus Live", layout="wide", page_icon="🚌")
-STRIDE_URL = "https://open-bus-stride-api.hasadna.org.il"
+st.set_page_config(page_title="Israel Bus Tracker PRO", layout="wide")
+BASE_URL = "https://open-bus-stride-api.hasadna.org.il"
 
-st.title("🚌 Israel Live Bus Tracker")
+st.title("🚌 Israel Live Bus Tracker (Fixed)")
 
-# 1. GET USER LOCATION
+# 1. GPS LOCATION
 loc = get_geolocation()
-if not loc:
-    st.info("📍 Fetching your GPS... Please allow access. (Default: Tel Aviv)")
-    u_lat, u_lon = 32.0853, 34.7818 
-else:
-    u_lat, u_lon = loc['coords']['latitude'], loc['coords']['longitude']
+u_lat, u_lon = (loc['coords']['latitude'], loc['coords']['longitude']) if loc else (32.1782, 34.9076)
 
-# 2. SEARCH INTERFACE
+# 2. SIDEBAR
 with st.sidebar:
     st.header("Search")
-    bus_num = st.text_input("Enter Bus Number:", value="149")
-    st.caption("Common lines: 149, 189, 1, 42")
-    refresh = st.button("🔄 Refresh Data")
+    bus_num = st.text_input("Bus Number:", value="149")
+    st.info("Try '149' or '1' for best testing.")
+    if st.button("Force Refresh"):
+        st.rerun()
 
-# --- DATA FETCHING (TWO-STEP PROCESS) ---
-
-def get_live_data(line_number):
+# --- 3. THE THREE-STEP DATA FETCH ---
+def get_verified_bus_locations(line_number):
     """
-    Step 1: Get the internal GTFS Route IDs for the line number.
-    Step 2: Use those IDs to fetch the Real-Time (SIRI) locations.
+    Step 1: Get GTFS Route IDs for the line number
+    Step 2: Get active Siri Ride IDs for those Route IDs
+    Step 3: Get Vehicle Locations for those Ride IDs
     """
     try:
-        # STEP 1: Find Route IDs
-        route_res = requests.get(
-            f"{STRIDE_URL}/gtfs_routes/list", 
-            params={"route_short_name": line_number, "limit": 50}
+        # STEP 1: Get Route IDs (Static Data)
+        # ----------------------------------
+        r1 = requests.get(f"{BASE_URL}/gtfs_routes/list", params={"route_short_name": line_number, "limit": 20})
+        gtfs_ids = [r['id'] for r in r1.json()]
+        if not gtfs_ids:
+            return [], "No Route IDs found."
+
+        # STEP 2: Get Active Rides (Real-time Meta)
+        # ----------------------------------------
+        # Look for rides started in the last 4 hours
+        start_time = (datetime.utcnow() - timedelta(hours=4)).isoformat()
+        r2 = requests.get(
+            f"{BASE_URL}/siri_rides/list", 
+            params={
+                "siri_route__gtfs_route_id__in": ",".join(map(str, gtfs_ids)),
+                "scheduled_start_time__gte": start_time,
+                "limit": 100
+            }
         )
-        if route_res.status_code != 200: return [], []
-        
-        route_ids = [r['id'] for r in route_res.json()]
-        if not route_ids: return [], []
+        ride_ids = [r['id'] for r in r2.json()]
+        if not ride_ids:
+            return [], f"Found routes ({len(gtfs_ids)}), but no active rides in the last 4h."
 
-        # STEP 2: Find Live Locations for these Route IDs
-        # We look back 15 minutes to find active buses
-        since_time = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
-        
-        # We filter vehicle locations by siri_ride__gtfs_ride__gtfs_route_id
-        ids_str = ",".join(map(str, route_ids))
-        loc_params = {
-            "siri_ride__gtfs_ride__gtfs_route_id__in": ids_str,
-            "recorded_at_time__gte": since_time,
-            "limit": 100
-        }
-        
-        loc_res = requests.get(f"{STRIDE_URL}/siri_vehicle_locations/list", params=loc_params)
-        buses = loc_res.json() if loc_res.status_code == 200 else []
+        # STEP 3: Get Vehicle Locations (Live GPS)
+        # ---------------------------------------
+        # Look for locations reported in the last 15 mins
+        loc_time = (datetime.utcnow() - timedelta(minutes=15)).isoformat()
+        r3 = requests.get(
+            f"{BASE_URL}/siri_vehicle_locations/list",
+            params={
+                "siri_ride_id__in": ",".join(map(str, ride_ids)),
+                "recorded_at_time__gte": loc_time,
+                "limit": 50
+            }
+        )
+        buses = r3.json()
+        return buses, f"Success! Found {len(buses)} buses for {len(ride_ids)} active rides."
 
-        return buses, route_ids
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return [], []
+        return [], f"Error: {str(e)}"
 
-# --- 3. LOGIC & MAPPING ---
+# --- 4. MAP & DISPLAY ---
 if bus_num:
-    with st.spinner(f"Filtering Line {bus_num}..."):
-        buses, route_ids = get_live_data(bus_num)
-        
-        # Display Summary
-        if not buses:
-            st.warning(f"No active buses found for line {bus_num}. (Check if it's currently running)")
-        else:
-            st.success(f"Tracking {len(buses)} vehicles for line {bus_num}")
-
-        # Create Map
-        m = folium.Map(location=[u_lat, u_lon], zoom_start=14)
+    buses, status_msg = get_verified_bus_locations(bus_num)
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.write(f"**Status:** {status_msg}")
+        m = folium.Map(location=[u_lat, u_lon], zoom_start=13)
         
         # User Marker
-        folium.Marker(
-            [u_lat, u_lon], popup="You", 
-            icon=folium.Icon(color='blue', icon='user', prefix='fa')
-        ).add_to(m)
-
-        # Bus Markers (Filtered by your specific line)
+        folium.Marker([u_lat, u_lon], popup="You", icon=folium.Icon(color='blue', icon='user', prefix='fa')).add_to(m)
+        
+        # Filtered Bus Markers
         for b in buses:
             folium.Marker(
                 [b['lat'], b['lon']],
                 popup=f"Line {bus_num} - Updated {b['recorded_at_time'].split('T')[1][:5]}",
                 icon=folium.Icon(color='green', icon='bus', prefix='fa')
             ).add_to(m)
+            
+        st_folium(m, width=800, height=500, key="israel_map")
 
-        # UI Layout
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st_folium(m, width=800, height=500, key="israel_bus_map")
-        
-        with col2:
-            st.subheader("Live Status")
-            if buses:
-                st.write(f"**Route IDs found:** {len(route_ids)}")
-                st.write("**Latest Data Point:**")
-                st.json({
-                    "ID": buses[0]['id'],
-                    "Time": buses[0]['recorded_at_time'],
-                    "Lat": buses[0]['lat']
-                })
-
+    with col2:
+        st.subheader("Diagnostic Log")
+        if buses:
+            st.json({
+                "Sample Bus ID": buses[0]['id'],
+                "Ride ID": buses[0]['siri_ride_id'],
+                "Line Number": bus_num
+            })
+        else:
+            st.write("No live data to display.")
